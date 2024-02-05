@@ -1,0 +1,195 @@
+---
+title: "BikeShareTest"
+author: "Lars Kutschinski"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r}
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(gbm)
+library(fastDummies)
+
+set.seed(123)
+data <- read.csv("hour.csv")
+
+# Convert 'dteday' to Date type and combine with 'hr' to create a datetime column
+# Adjusting the conversion to Date to ensure correct handling of time zones
+data$datetime <- as.POSIXct(paste(data$dteday, data$hr), format="%Y-%m-%d %H", tz="UTC")
+data$Date <- as.Date(data$datetime, tz="UTC")
+
+# Exclude 'casual', 'registered', and original 'dteday' from the model
+data <- data[, !(names(data) %in% c("casual", "registered", "dteday"))]
+
+# Initialize variables to store metrics
+rf_mae_values <- c()
+rf_mse_values <- c()
+
+gbm_mae_values <- c()
+gbm_mse_values <- c()
+
+linear_mae_values <- c()
+linear_mse_values <- c()
+
+baseline_mae_values <- c()
+baseline_mse_values <- c()
+
+# Unique dates
+unique_dates <- unique(data$Date)
+
+# Time series cross-validation
+for(i in 700:(length(unique_dates) - 1)) {
+  # Define the train-test split based on days
+  train_end_date <- unique_dates[i]
+  test_date <- unique_dates[i + 1]
+  
+  # Split data into training and testing
+  train_data <- data[data$Date <= train_end_date,]
+  test_data <- data[data$Date == test_date,]
+  
+  # Build the random forest model
+  rf_model <- randomForest(cnt ~ . - Date - instant - temp, data = train_data, ntree = 50, nodesize = 5)
+  gbm_model <- gbm(cnt ~ . - datetime - Date - instant - temp, 
+                   data = train_data, 
+                   distribution = "poisson",
+                   n.trees = 1000, 
+                   interaction.depth = 4,
+                   shrinkage = 0.01,
+                   cv.folds = 5,
+                   n.minobsinnode = 15)
+  best.iter <- gbm.perf(gbm_model, method = "cv")
+  gbm_predictions <- predict(gbm_model, test_data, n.trees = best.iter)
+  gbm_predictions <- exp(gbm_predictions)
+  
+  linear_model <- lm(cnt ~ ., data = train_data)
+  
+  # Make predictions on the test data
+  rf_predictions <- predict(rf_model, test_data)
+  linear_predictions <- predict(linear_model, newdata = test_data)
+
+  
+  baseline_predictions <- tail(train_data$cnt, 24)
+  baseline_mae <- mean(abs(test_data$cnt - baseline_predictions))
+  baseline_mse <- sqrt(mean((test_data$cnt - baseline_predictions)^2))
+  
+  baseline_mae_values <- c(baseline_mae_values, baseline_mae)
+  baseline_mse_values <- c(baseline_mse_values, baseline_mse)
+  
+  rf_mae_values <- c(rf_mae_values, mean(abs(rf_predictions - test_data$cnt)))
+  rf_mse_values <- c(rf_mse_values, sqrt(mean((rf_predictions - test_data$cnt)^2)))
+  
+  linear_mae_values <- c(linear_mae_values, mean(abs(linear_predictions - test_data$cnt)))
+  linear_mse_values <- c(linear_mse_values, sqrt(mean((linear_predictions - test_data$cnt)^2)))
+  
+  gbm_mae_values <- c(gbm_mae_values, mean(abs(gbm_predictions - test_data$cnt)))
+  gbm_mse_values <- c(gbm_mse_values, sqrt(mean((gbm_predictions - test_data$cnt)^2)))
+  
+}
+```
+
+
+```{r}
+library(corrplot)
+library(caret)
+cor_data <- data[, !(names(data) %in% c("weathersit", "weekday", "workingday", "holiday", "yr", "season", "mnth"))]
+cor_matrix <- cor(cor_data[, sapply(cor_data, is.numeric)])
+
+
+corrplot(cor_matrix, method = "color", order = "hclust", addCoef.col = "black",
+         tl.col = "black", tl.srt = 45, title = "Correlation Heatmap", number.cex = 0.5, mar=c(0,0,2,0))
+
+```
+
+
+```{r}
+
+# Calculate the average of the MAE and MSE over all iterations
+rf_avg_mae <- mean(rf_mae_values)
+rf_avg_mse <- mean(rf_mse_values)
+
+gbm_avg_mae <- mean(gbm_mae_values)
+gbm_avg_mse <- mean(gbm_mse_values)
+
+linear_avg_mae <- mean(linear_mae_values)
+linear_avg_mse <- mean(linear_mse_values)
+
+avg_baseline_mae <- mean(baseline_mae_values)
+avg_baseline_mse <- mean(baseline_mse_values)
+
+# Output the average MAE and MSE for the baseline model
+print(paste("Average Baseline Mean Absolute Error:", avg_baseline_mae))
+print(paste("Average Baseline Mean Squared Error:", avg_baseline_mse))
+
+# Output the average MAE and MSE
+print(paste("RF Average Mean Absolute Error:", rf_avg_mae))
+print(paste("RF Average Mean Squared Error:", rf_avg_mse))
+
+print(paste("Linear Average Mean Absolute Error:", linear_avg_mae))
+print(paste("Linear Average Mean Squared Error:", linear_avg_mse))
+
+print(paste("GBM Average Mean Absolute Error:", gbm_avg_mae))
+print(paste("GBM Average Mean Squared Error:", gbm_avg_mse))
+
+
+gbm_importance <- summary(gbm_model)
+print(gbm_importance)
+importance_df <- as.data.frame(gbm_importance)
+
+ggplot(importance_df, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Flips the axes for horizontal bars
+  xlab("Features") +
+  ylab("Relative Importance") +
+  ggtitle("Feature Importance from GBM Model")
+
+importance_data <- importance(rf_model)
+
+# Convert to a data frame for easy plotting
+importance_df <- as.data.frame(importance_data)
+
+
+# Add a row name column to the data frame
+importance_df$Feature <- row.names(importance_df)
+
+summary(linear_model)
+
+# Melt the data frame for ggplot (using reshape2 package)
+library(reshape2)
+importance_melted <- melt(importance_df, id.vars = "Feature") 
+importance_melted_filtered <- importance_melted[importance_melted$Feature != "hr", ]
+
+# Plotting the feature importance
+ggplot(importance_melted_filtered, aes(x = Feature, y = value)) +
+  geom_bar(stat = "identity", position = position_dodge(), fill = "purple") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Feature", y = "Importance", title = "Feature Importance in Random Forest Model")
+```
+
+
+```{r}
+library(ggplot2)
+per <- 1:15
+i1 <- c(rep("T",10), rep("F", 1), rep(" ", 4))
+i2 <- c(rep("T",11), rep("F", 1), rep(" ", 3))
+i3 <- c(rep("T",12), rep("F", 1), rep(" ", 2))
+i4 <- c(rep("T",13), rep("F", 1), rep(" ", 1))
+i5 <- c(rep("T",14), rep("F", 1))
+
+df = tibble::tibble(iteration = sort(rep(1:5, length(per))),
+                    period = rep(per, 5),
+                    type = c(i1, i2, i3, i4, i5))
+
+ggplot(df, aes(x = period, y = -iteration, label = type, color = type)) +
+  geom_segment(aes(xend = 16, yend = -iteration), 
+               color = "black", 
+               arrow = grid::arrow(angle = 30, length = unit(0.1, "inches"), type = "closed")) +
+  geom_point(size = 5) +
+  geom_text(color = "black") +
+  labs(x = "Period (t)") +
+  scale_color_manual(values = c("T" = "#619CFF", "F" = "#00BA38", " " = "grey")) +
+  scale_y_continuous(labels = abs, name = "Iteration (fold)", limits = c(-5.25, -.75)) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank())
+```
